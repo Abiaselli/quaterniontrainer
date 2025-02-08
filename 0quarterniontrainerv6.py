@@ -1,0 +1,1750 @@
+import tkinter as tk
+from tkinter import ttk, filedialog, messagebox, simpledialog
+import json
+import threading
+import logging
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import math
+from torch.utils.data import DataLoader
+import os
+from transformers import PreTrainedTokenizerFast, AddedToken
+from tokenizers import Tokenizer, models, pre_tokenizers
+import numpy as np
+import psutil
+from torch.amp import GradScaler
+
+
+# Print whether CUDA is available
+print(f"CUDA Available: {torch.cuda.is_available()}")
+#debug for cuda
+import os
+os.environ["CUDA_LAUNCH_BLOCKING"] = "1"
+
+# Global tokenizer variable for multiprocessing
+tokenizer = None
+scaler = GradScaler()
+
+
+def log_system_usage():
+    cpu_percent = psutil.cpu_percent(interval=1)
+    virtual_memory = psutil.virtual_memory()
+    ram_used = virtual_memory.used / (1024 ** 3)  # Convert to GB
+    ram_total = virtual_memory.total / (1024 ** 3)  # Convert to GB
+
+    logging.info(f"CPU Usage: {cpu_percent}%")
+    logging.info(f"RAM Usage: {ram_used:.2f} GB / {ram_total:.2f} GB")
+
+
+
+def save_checkpoint(model, optimizer, epoch, phase, path):
+    checkpoint = {
+        'epoch': epoch,
+        'phase': phase,
+        'model_state_dict': model.state_dict(),
+        'optimizer_state_dict': optimizer.state_dict()
+    }
+    torch.save(checkpoint, path)
+
+def load_checkpoint(path, model, optimizer=None):
+    checkpoint = torch.load(path)
+    model.load_state_dict(checkpoint['model_state_dict'])
+    if optimizer:
+        optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+    return checkpoint['epoch'], checkpoint['phase']
+
+
+def init_tokenizer(tokenizer_path):
+    global tokenizer
+    tokenizer = PreTrainedTokenizerFast(tokenizer_file=tokenizer_path)
+    logging.info(f"Tokenizer pad_token set to: {tokenizer.pad_token}, ID: {tokenizer.pad_token_id}")
+
+
+@staticmethod
+def tokenize_chunk(chunk):
+    # Tokenizer is now the global variable initialized in each process
+    encoded = tokenizer(chunk, return_attention_mask=False, truncation=True, max_length=1024)
+    return encoded['input_ids']
+
+# Collate function
+def collate_fn(batch):
+    if len(batch[0]) == 3:
+        # Dataset returns: input_ids, labels, seq_lengths
+        input_ids, labels, seq_lengths = zip(*batch)
+        input_ids = torch.stack(input_ids)
+        labels = torch.stack(labels)
+        seq_lengths = torch.tensor(seq_lengths, dtype=torch.long)
+        return input_ids, labels, seq_lengths
+    elif len(batch[0]) == 4:
+        # Dataset returns: input_ids, attention_masks, labels, seq_lengths
+        input_ids, attention_masks, labels, seq_lengths = zip(*batch)
+        input_ids = torch.stack(input_ids)
+        attention_masks = torch.stack(attention_masks)
+        labels = torch.stack(labels)
+        seq_lengths = torch.tensor(seq_lengths, dtype=torch.long)
+        return input_ids, attention_masks, labels, seq_lengths
+    else:
+        raise ValueError("Unexpected number of elements in dataset sample.")
+
+class ChunkedDataset(torch.utils.data.Dataset):
+    def __init__(self, tokenized_data_path, tokenizer, max_length=1024):
+        self.tokenized_data_path = tokenized_data_path
+        self.tokenizer = tokenizer
+        self.max_length = max_length
+
+        # Get a list of chunk files
+        self.chunk_files = [os.path.join(self.tokenized_data_path, f) 
+                            for f in os.listdir(self.tokenized_data_path) 
+                            if f.startswith('chunk_') and f.endswith('.jsonl')]
+        self.chunk_files.sort()  # Ensure the chunks are in order
+
+        # Build an index mapping from global indices to (chunk_idx, sample_idx)
+        self.index_mapping = []
+        for chunk_idx, chunk_file in enumerate(self.chunk_files):
+            with open(chunk_file, 'r', encoding='utf-8') as f:
+                num_lines = sum(1 for _ in f)
+            self.index_mapping.extend([(chunk_idx, i) for i in range(num_lines)])
+
+        # Initialize current chunk data
+        self.current_chunk_idx = -1  # Indicates no chunk is currently loaded
+        self.current_chunk_data = []  # Will hold the data from the current chunk
+
+    def __len__(self):
+        return len(self.index_mapping)
+
+    def __getitem__(self, idx):
+
+        if idx < 0 or idx >= len(self.index_mapping):
+            raise IndexError(f"Index {idx} out of range for dataset of size {len(self.index_mapping)}")
+
+        chunk_idx, sample_idx = self.index_mapping[idx]
+
+        # Load the appropriate chunk if not already loaded
+        if self.current_chunk_idx != chunk_idx:
+            self.load_chunk(chunk_idx)
+
+        record = self.current_chunk_data[sample_idx]
+        input_ids = record['input_ids']
+        labels = record['labels']
+
+        # Calculate original sequence length before padding
+        original_seq_length = min(len(input_ids), self.max_length)
+        logging.debug(f"original sequence length = {original_seq_length}")
+        # Pad sequences to max_length
+        input_ids = input_ids[:self.max_length] + [self.tokenizer.pad_token_id] * max(0, self.max_length - len(input_ids))
+        labels = labels[:self.max_length] + [self.tokenizer.pad_token_id] * max(0, self.max_length - len(labels))
+
+        assert isinstance(input_ids, list), "input_ids should be a list"
+        assert isinstance(labels, list), "labels should be a list"
+        assert all(isinstance(id, int) for id in input_ids), "All input_ids should be integers"
+        assert all(isinstance(id, int) for id in labels), "All labels should be integers"
+        assert len(input_ids) == self.max_length, "input_ids should be padded to max_length"
+        assert len(labels) == self.max_length, "labels should be padded to max_length"
+        
+        input_ids = torch.tensor(input_ids, dtype=torch.long)
+        labels = torch.tensor(labels, dtype=torch.long)
+        attention_mask = (input_ids != self.tokenizer.pad_token_id).long()
+        seq_lengths = torch.tensor(original_seq_length, dtype=torch.long)
+
+        # Check for empty sequences
+        if len(input_ids) == 0:
+            logging.error(f"Empty input_ids at index {idx}.")
+            raise ValueError(f"Empty input_ids at index {idx}.")
+        if len(labels) == 0:
+            logging.error(f"Empty labels at index {idx}.")
+            raise ValueError(f"Empty labels at index {idx}.")
+    
+        return input_ids, attention_mask, labels, seq_lengths
+
+    def load_chunk(self, idx):
+        chunk_file = self.chunk_files[idx]
+        with open(chunk_file, 'r', encoding='utf-8') as f:
+            self.current_chunk_data = [json.loads(line.strip()) for line in f]
+        self.current_chunk_idx = idx
+
+class QuaternionEmbedding(nn.Module):
+    def __init__(self, vocab_size, embedding_dim):
+        super(QuaternionEmbedding, self).__init__()
+        self.vocab_size = vocab_size
+        self.embedding_dim = embedding_dim
+        
+        # Each token is represented by a quaternion: a + bi + cj + dk
+        self.scalar = nn.Embedding(vocab_size, embedding_dim)  # a
+        self.vector_i = nn.Embedding(vocab_size, embedding_dim)  # b
+        self.vector_j = nn.Embedding(vocab_size, embedding_dim)  # c
+        self.vector_k = nn.Embedding(vocab_size, embedding_dim)  # d
+
+    def forward(self, x):
+        # Retrieve scalar and vector components
+        a = self.scalar(x)
+        b = self.vector_i(x)
+        c = self.vector_j(x)
+        d = self.vector_k(x)
+        
+        # Combine into quaternion format: a + bi + cj + dk
+        return torch.stack([a, b, c, d], dim=-1)  # Shape: (batch_size, seq_length, embedding_dim, 4)
+
+class QuaternionRotationalEncoding(nn.Module):
+    def __init__(self, seq_length, embedding_dim):
+        super(QuaternionRotationalEncoding, self).__init__()
+        self.seq_length = seq_length
+        self.embedding_dim = embedding_dim
+
+        # Generate rotation quaternions
+        positions = torch.arange(seq_length).unsqueeze(-1).float()
+        self.theta = nn.Parameter(positions * (np.pi / seq_length))  # Scale theta by position
+
+    def forward(self, x):
+        # Compute rotation quaternions
+        cos_theta = torch.cos(self.theta).unsqueeze(-1)
+        sin_theta = torch.sin(self.theta).unsqueeze(-1)
+        r = torch.cat([cos_theta, sin_theta, sin_theta, sin_theta], dim=-1)
+        r = r / r.norm(dim=-1, keepdim=True).clamp(min=1e-6)
+
+        # Apply rotation: r * x * r^-1
+        rotated = self.quaternion_multiply(r, x)
+        rotated = self.quaternion_multiply(rotated, self.quaternion_conjugate(r))
+
+        return rotated
+
+    def quaternion_multiply(self, q1, q2):
+        """Quaternion multiplication."""
+        a1, b1, c1, d1 = q1[..., 0], q1[..., 1], q1[..., 2], q1[..., 3]
+        a2, b2, c2, d2 = q2[..., 0], q2[..., 1], q2[..., 2], q2[..., 3]
+
+        scalar = a1 * a2 - b1 * b2 - c1 * c2 - d1 * d2
+        i = a1 * b2 + b1 * a2 + c1 * d2 - d1 * c2
+        j = a1 * c2 - b1 * d2 + c1 * a2 + d1 * b2
+        k = a1 * d2 + b1 * c2 - c1 * b2 + d1 * a2
+
+        return torch.stack([scalar, i, j, k], dim=-1)
+
+    def quaternion_conjugate(self, q):
+        """Conjugate of a quaternion."""
+        return torch.cat([q[..., :1], -q[..., 1:]], dim=-1)
+
+
+class QuaternionAttention(nn.Module):
+    def __init__(self, embedding_dim):
+        super(QuaternionAttention, self).__init__()
+        self.embedding_dim = embedding_dim
+        
+        # Learnable weights for query, key, and value
+        self.query_weight = nn.Linear(embedding_dim * 4, embedding_dim * 4)
+        self.key_weight = nn.Linear(embedding_dim * 4, embedding_dim * 4)
+        self.value_weight = nn.Linear(embedding_dim * 4, embedding_dim * 4)
+
+    def quaternion_dot(self, q1, q2):
+        """Compute quaternion dot product (element-wise)."""
+        a1, b1, c1, d1 = q1[..., 0], q1[..., 1], q1[..., 2], q1[..., 3]
+        a2, b2, c2, d2 = q2[..., 0], q2[..., 1], q2[..., 2], q2[..., 3]
+
+        scalar_part = a1 * a2 - b1 * b2 - c1 * c2 - d1 * d2
+        vector_part_i = a1 * b2 + b1 * a2 + c1 * d2 - d1 * c2
+        vector_part_j = a1 * c2 - b1 * d2 + c1 * a2 + d1 * b2
+        vector_part_k = a1 * d2 + b1 * c2 - c1 * b2 + d1 * a2
+
+        return torch.stack([scalar_part, vector_part_i, vector_part_j, vector_part_k], dim=-1)
+
+    def forward(self, query, key, value, mask=None):
+        query = query.reshape(query.shape[0], query.shape[1], -1)
+        key = key.reshape(key.shape[0], key.shape[1], -1)
+        value = value.reshape(value.shape[0], value.shape[1], -1)
+
+        Q = self.query_weight(query)
+        K = self.key_weight(key)
+        V = self.value_weight(value)
+
+        Q = Q.reshape(Q.shape[0], Q.shape[1], -1, 4)
+        K = K.reshape(K.shape[0], K.shape[1], -1, 4)
+        V = V.reshape(V.shape[0], V.shape[1], -1, 4)
+
+        attention_scores = torch.einsum('bseq,bkeq->bsk', Q, K)  # (batch, seq_len, seq_len)
+
+        # Apply mask before softmax
+        if mask is not None:
+            attention_scores = attention_scores.masked_fill(mask == 0, float('-inf'))
+
+        attention_scores = attention_scores / np.sqrt(self.embedding_dim)
+        attention_weights = F.softmax(attention_scores, dim=-1)
+
+        output = torch.einsum('bsk,bseq->bseq', attention_weights, V)
+        return output, attention_weights
+
+class QuaternionFeedForward(nn.Module):
+    def __init__(self, embedding_dim, hidden_dim):
+        super(QuaternionFeedForward, self).__init__()
+        self.hidden_dim = hidden_dim
+
+        # Fully connected layers for quaternion processing
+        self.fc1 = nn.Linear(embedding_dim * 4, hidden_dim * 4)
+        self.fc2 = nn.Linear(hidden_dim * 4, embedding_dim * 4)
+
+    def forward(self, x):
+        batch_size, seq_len, embedding_dim, quaternion_dim = x.shape
+
+        # Flatten quaternion dimension
+        x = x.reshape(batch_size, seq_len, -1)  # Shape: (batch_size, seq_len, embedding_dim * 4)
+        x = self.fc1(x)
+        x = F.gelu(x)
+        x = self.fc2(x)
+        x = x.reshape(batch_size, seq_len, embedding_dim, quaternion_dim)  # Restore quaternion structure
+        return x
+
+class QuaternionTransformerBlock(nn.Module):
+    def __init__(self, embedding_dim, hidden_dim, seq_length):
+        super(QuaternionTransformerBlock, self).__init__()
+        self.rotation_encoding = QuaternionRotationalEncoding(seq_length, embedding_dim)
+        self.attention = QuaternionAttention(embedding_dim)
+        self.feed_forward = QuaternionFeedForward(embedding_dim, hidden_dim)
+        self.norm1 = nn.LayerNorm([embedding_dim, 4])
+        self.norm2 = nn.LayerNorm([embedding_dim, 4])
+
+    def forward(self, x, mask=None):
+        # Apply rotational encoding
+        x = self.rotation_encoding(x)
+
+        # Attention layer
+        attn_output, attention_weights = self.attention(x, x, x, mask)  
+        x = self.norm1(x + attn_output)
+
+        # Feed-forward layer
+        ff_output = self.feed_forward(x)
+        x = self.norm2(x + ff_output)
+
+        return x, attention_weights  
+
+
+
+class QuaternionTransformer(nn.Module):
+    def __init__(self, vocab_size, embedding_dim, hidden_dim, seq_length, num_layers):
+        super(QuaternionTransformer, self).__init__()
+        self.embedding = QuaternionEmbedding(vocab_size, embedding_dim)
+        self.layers = nn.ModuleList([
+            QuaternionTransformerBlock(embedding_dim, hidden_dim, seq_length) for _ in range(num_layers)
+        ])
+        self.output_projection = nn.Linear(embedding_dim * 4, vocab_size)
+
+    def forward(self, x, mask=None):
+        x = self.embedding(x)
+        attention_weights_list = []  # Store attention maps
+
+        for layer in self.layers:
+            x, attn_weights = layer(x, mask)  # Capture attention weights per layer
+            attention_weights_list.append(attn_weights)
+        logging.debug(f"Logits shape before projection: {x.shape}")
+        logits = self.output_projection(x.reshape(x.shape[0], x.shape[1], -1))
+        logging.debug(f"Logits shape qtrans: {logits.shape}")
+        return logits, attention_weights_list  
+
+
+# Generate src mask function
+def generate_square_subsequent_mask(sz):
+    mask = (torch.triu(torch.ones(sz, sz)) == 1).transpose(0, 1)
+    mask = mask.float().masked_fill(mask == 0, float('-inf')).masked_fill(mask == 1, float(0.0))
+    return mask
+
+def create_combined_mask(batch_input_ids, pad_token_id):
+    """
+    Create a combined attention mask that incorporates both the causal (subsequent) mask
+    and the padding mask. This function ensures that each row has at least one valid token.
+    """
+    batch_size, seq_len = batch_input_ids.size()
+    device = batch_input_ids.device
+    
+    # Generate causal (subsequent) mask: shape (seq_len, seq_len)
+    causal_mask = generate_square_subsequent_mask(seq_len).to(device)
+    logging.debug(f"Shape of causal_mask before expand: {causal_mask.shape}")
+
+    # Expand to batch dimension: (batch_size, seq_len, seq_len)
+    causal_mask = causal_mask.unsqueeze(0).expand(batch_size, -1, -1)
+    logging.debug(f"Shape of causal_mask after expansion: {causal_mask.shape}")
+    # Create padding mask: valid tokens are True, padded tokens are False.
+    # Shape: (batch_size, seq_len)
+    padding_mask = (batch_input_ids != pad_token_id)
+    # Expand padding mask to match the shape (batch_size, seq_len, seq_len)
+    # Here we broadcast along one dimension so that we mask out positions in each row.
+    padding_mask_expanded = padding_mask.unsqueeze(1).expand(batch_size, seq_len, seq_len)
+    logging.debug(f"Shape of padding_mask after expansion: {padding_mask_expanded.shape}")
+
+    # Combine masks: where padding_mask is False, set to -inf.
+    # This keeps the causal structure while ensuring that padded positions are fully masked.
+    combined_mask = causal_mask.masked_fill(~padding_mask_expanded, float('-inf'))
+    logging.debug(f"Shape of combined_mask after fill: {combined_mask.shape}")
+
+    # Check each row: if an entire row is -inf, force the first token (or a designated position) to be valid.
+    for i in range(batch_size):
+        for j in range(seq_len):
+            if torch.all(combined_mask[i, j] == float('-inf')):
+                combined_mask[i, j, 0] = 0.0  # Force at least one valid position
+    
+    return combined_mask
+
+class QuaternionTransformerGUI:
+    def __init__(self, root):
+        self.root = root
+        self.root.title("Quaternion Transformer GUI")
+
+        # Transformer Parameters
+        self.layers = []
+        # Model Configuration Variables
+        self.model_name = tk.StringVar(value="QuaternionTransformer")
+        self.num_parameters = tk.IntVar(value=1024)
+        self.vocab_size = tk.IntVar(value=30000)
+        self.hidden_size = tk.IntVar(value=8)
+        self.num_layers = tk.IntVar(value=8)
+
+        self.pad_token_id = 0  # Default value, adjust based on your tokenizer setup
+
+        # Device Selection Variable
+        self.device_option = tk.StringVar(value="GPU" if torch.cuda.is_available() else "CPU")
+
+        # Dynamically calculate parameters based on other inputs
+        self.vocab_size.trace_add("write", lambda *args: self.update_num_parameters())
+        self.hidden_size.trace_add("write", lambda *args: self.update_num_parameters())
+        self.num_layers.trace_add("write", lambda *args: self.update_num_parameters())
+
+        # Set initial calculated value
+        self.update_num_parameters()
+
+        # Training Parameters
+        self.dataset_path = ""
+        self.vocab_path = ""
+        self.tokenizer_path = ""
+        self.batch_size = tk.IntVar(value=8)
+        self.learning_rate = tk.DoubleVar(value=0.0001)
+        self.epochs = tk.IntVar(value=1)
+
+        # Training Variables
+        self.loss_history = []
+        self.accuracy_history = []
+        self.current_epoch = 0
+        self.stop_training = threading.Event()
+
+        # Model and Data Variables
+        self.model = None
+        self.tokenizer = None
+        self.dataset_path = None
+        self.vocab_path = None
+        self.tokenizer_path = None
+        self.model_path = None
+        self.train_data = None  # To store the dataset
+        self.tokenized_data_path = None  # To store the tokenized data file path
+        self.test_bool=False
+
+        # Device (CPU or GPU) - Initially set based on device_option
+        self.device = torch.device(self.map_device(self.device_option.get()))
+
+        # Select log file path
+        self.select_log_file()
+
+        # Setup logging
+        logging.basicConfig(filename=self.log_file_path, level=logging.INFO,
+                            format='%(asctime)s - %(levelname)s - %(message)s')
+
+        logging.info(f"Using device: {self.device}")
+
+        self.create_widgets()
+
+    def map_device(self, selected_device):
+        device_mapping = {
+            "CPU": "cpu",
+            "GPU": "cuda"
+        }
+        return device_mapping.get(selected_device, "cpu")
+
+    def create_widgets(self):
+        # Transformer Construction Frame
+        transformer_frame = ttk.LabelFrame(self.root, text="Transformer Construction", padding=(10, 10))
+        transformer_frame.pack(fill="x", padx=10, pady=5)
+
+        ttk.Label(transformer_frame, text="Number of Parameters:").grid(row=0, column=0, sticky="w")
+        ttk.Entry(transformer_frame, textvariable=self.num_parameters, state="readonly").grid(row=0, column=1)
+
+        ttk.Label(transformer_frame, text="Vocabulary Size:").grid(row=2, column=0, sticky="w")
+        ttk.Entry(transformer_frame, textvariable=self.vocab_size).grid(row=2, column=1)
+
+        ttk.Label(transformer_frame, text="Hidden Size:").grid(row=3, column=0, sticky="w")
+        ttk.Entry(transformer_frame, textvariable=self.hidden_size).grid(row=3, column=1)
+
+        ttk.Label(transformer_frame, text="Number of Layers:").grid(row=2, column=4, sticky="w")
+        ttk.Entry(transformer_frame, textvariable=self.num_layers).grid(row=2, column=5)
+
+        # Device Selection
+        ttk.Label(transformer_frame, text="Select Device:").grid(row=4, column=0, sticky="w", pady=(10, 0))
+        device_options = ["CPU"]
+        if torch.cuda.is_available():
+            device_options.append("GPU")
+        device_combo = ttk.Combobox(transformer_frame, textvariable=self.device_option, values=device_options, state="readonly")
+        device_combo.grid(row=4, column=1, sticky="w", pady=(10, 0))
+        device_combo.bind("<<ComboboxSelected>>", self.on_device_change)
+
+        # Attach parameter calculation to variable updates
+        self.vocab_size.trace_add("write", lambda *args: self.update_num_parameters())
+        self.hidden_size.trace_add("write", lambda *args: self.update_num_parameters())
+        self.num_layers.trace_add("write", lambda *args: self.update_num_parameters())
+
+        # For resuming training
+        ttk.Button(transformer_frame, text="Select Model File", command=self.select_model_file).grid(row=3, column=2, pady=5)
+
+        # Architecture selection
+        self.architecture = tk.StringVar(value="Quaternion Transformer")
+        ttk.Label(transformer_frame, text="Select Architecture:").grid(row=0, column=2, sticky="w")
+        ttk.Combobox(transformer_frame, textvariable=self.architecture, values=["Quaternion Transformer", "Quaternion MatMul-Free LM"], state="readonly").grid(row=0, column=3)
+
+        ttk.Button(transformer_frame, text="Add Layer", command=self.add_layer).grid(row=4, column=0, pady=5)
+        ttk.Button(transformer_frame, text="Save Transformer and Model", command=self.save_transformer_and_model).grid(row=1, column=3, pady=5)
+        ttk.Button(transformer_frame, text="Load Transformer", command=self.load_transformer).grid(row=1, column=2, pady=5)
+        ttk.Button(transformer_frame, text="Initialize/Load Model", command=self.load_model).grid(row=2, column=3, pady=5)
+
+        # Data Selection Frame
+        data_frame = ttk.LabelFrame(self.root, text="Data Selection", padding=(10, 10))
+        data_frame.pack(fill="x", padx=10, pady=5)
+        self.use_chunked_dataset = tk.BooleanVar(value=False)
+        self.test_bool = tk.BooleanVar(value=False)
+        
+        ttk.Checkbutton(data_frame, text="Use Chunked Dataset", variable=self.use_chunked_dataset).pack(pady=5)
+        ttk.Checkbutton(data_frame, text="Use Std/bert Model", variable=self.test_bool).pack(pady=5)
+        ttk.Button(data_frame, text="Select Dataset Directory", command=self.select_dataset).pack(pady=5)
+        ttk.Button(data_frame, text="Load Dataset", command=self.load_dataset).pack(pady=5)
+        ttk.Button(data_frame, text="Save Dataset as Text File", command=self.save_dataset_as_text).pack(pady=5)
+        ttk.Button(data_frame, text="Select Vocabulary File", command=self.select_vocab).pack(pady=5)
+        ttk.Button(data_frame, text="Create Tokenizer from Vocab", command=self.create_tokenizer_from_vocab).pack(pady=5)
+        ttk.Button(data_frame, text="Load Tokenizer", command=self.load_tokenizer).pack(pady=5)
+        ttk.Button(data_frame, text="Test Tokenizer", command=self.test_tokenizer).pack(pady=5)
+        ttk.Button(data_frame, text="Test Training", command=self.training_test).pack(pady=5)
+
+
+        # New buttons for tokenized data
+        ttk.Button(data_frame, text="Select/Create Tokenized Data", command=self.select_or_create_tokenized_data).pack(pady=5)
+        ttk.Button(data_frame, text="Tokenize Data", command=self.tokenize_data).pack(pady=5)
+
+        # Training Configuration Frame
+        train_frame = ttk.LabelFrame(self.root, text="Training Configuration", padding=(10, 10))
+        train_frame.pack(fill="x", padx=10, pady=5)
+
+        ttk.Label(train_frame, text="Batch Size:").grid(row=0, column=0, sticky="w")
+        ttk.Entry(train_frame, textvariable=self.batch_size).grid(row=0, column=1)
+
+        ttk.Label(train_frame, text="Learning Rate:").grid(row=1, column=0, sticky="w")
+        ttk.Entry(train_frame, textvariable=self.learning_rate).grid(row=1, column=1)
+
+        ttk.Label(train_frame, text="Epochs:").grid(row=2, column=0, sticky="w")
+        ttk.Entry(train_frame, textvariable=self.epochs).grid(row=2, column=1)
+
+        ttk.Button(train_frame, text="Start Training", command=self.start_training).grid(row=3, column=0, pady=5)
+        ttk.Button(train_frame, text="Save Model", command=self.save_model).grid(row=3, column=1, pady=5)
+        ttk.Button(train_frame, text="Stop Training", command=self.stop_training_command).grid(row=4, column=0, pady=5)
+        self.training_mode = tk.StringVar(value="response")  # Default
+        training_modes = ["imitation", "completion", "response"]
+        ttk.Combobox(data_frame, textvariable=self.training_mode, values=training_modes, state="readonly").pack(pady=5)
+
+        # Progress Bar
+        self.progress_bar = ttk.Progressbar(self.root, orient='horizontal', length=400, mode='determinate')
+        self.progress_bar.pack(pady=10)
+        self.status_label = ttk.Label(self.root, text="Status: Ready")
+        self.status_label.pack(pady=5)
+
+    def select_log_file(self):
+        self.log_file_path = filedialog.asksaveasfilename(
+            title="Select Log File Location",
+            defaultextension=".log",
+            filetypes=[("Log files", "*.log"), ("All files", "*.*")]
+        )
+        if self.log_file_path:
+            print(f"Log file will be saved to: {self.log_file_path}")
+        else:
+            self.log_file_path = 'training_debug.log'  # Default log file
+            print(f"No log file selected. Using default: {self.log_file_path}")
+
+    def calculate_parameters(self, vocab_size, embed_size, num_layers, hidden_size):
+        embedding_params = vocab_size * embed_size * 2  # Input and output embeddings
+        transformer_params = num_layers * (4 * (hidden_size ** 2) + 2 * embed_size * hidden_size)  # Transformer layers
+        total_params = (embedding_params + transformer_params) 
+        return total_params
+
+    def update_num_parameters(self):
+        vocab_size = self.vocab_size.get()
+        embed_size = self.hidden_size.get()
+        num_layers = self.num_layers.get()
+        hidden_size = self.hidden_size.get()
+
+        total_params = self.calculate_parameters(vocab_size, embed_size, num_layers, hidden_size)
+        self.num_parameters.set(total_params)
+
+    def on_device_change(self, event):
+        selected_device = self.device_option.get()
+        if selected_device == "GPU" and not torch.cuda.is_available():
+            messagebox.showerror("Error", "GPU selected but CUDA is not available on this system.")
+            self.device_option.set("CPU")
+            selected_device = "CPU"
+        device_str = self.map_device(selected_device)
+        self.device = torch.device(device_str)
+        logging.info(f"Device changed to: {self.device}")
+        messagebox.showinfo("Device Selection", f"Computation device set to: {selected_device}")
+
+    def resize_checkpoint_weights(self, state_dict, new_vocab_size, embed_size):
+        """
+        Resize checkpoint weights to match the current model's dimensions.
+        """
+        # This method may need to be updated depending on the model's state_dict keys
+        return state_dict
+
+    def select_model_file(self):
+        self.model_path = filedialog.askopenfilename(
+            title="Select Model File",
+            filetypes=[("Model Files", "*.pth;*.json"), ("All files", "*.*")]
+        )
+        if self.model_path:
+            if self.model_path.endswith('.json'):
+                # Load model configuration
+                with open(self.model_path, 'r') as f:
+                    config = json.load(f)
+                # Update GUI parameters
+                self.vocab_size.set(config.get("vocab_size", self.vocab_size.get()))
+                self.hidden_size.set(config.get("embed_size", self.hidden_size.get()))
+                self.num_layers.set(config.get("num_layers", self.num_layers.get()))
+                self.architecture.set(config.get("architecture", self.architecture.get()))
+                messagebox.showinfo("Success", f"Model configuration loaded from: {self.model_path}")
+            elif self.model_path.endswith('.pth'):
+                # Load model weights
+                config_directory = os.path.dirname(self.model_path)
+                config_path = os.path.join(config_directory, 'model_config.json')
+                if os.path.exists(config_path):
+                    with open(config_path, 'r') as f:
+                        config = json.load(f)
+                    # Update GUI parameters
+                    self.vocab_size.set(config.get("vocab_size", self.vocab_size.get()))
+                    self.hidden_size.set(config.get("embed_size", self.hidden_size.get()))
+                    self.num_layers.set(config.get("num_layers", self.num_layers.get()))
+                    self.architecture.set(config.get("architecture", self.architecture.get()))
+                    # Load the model
+                    self.load_model()
+                    # Load model state
+                    state_dict = torch.load(self.model_path, map_location=self.device)
+                    self.model.load_state_dict(state_dict)
+                    messagebox.showinfo("Success", f"Model weights and configuration loaded from: {self.model_path}")
+                else:
+                    messagebox.showwarning("Warning", "Model configuration file not found. Please ensure the configuration is set correctly.")
+            else:
+                messagebox.showerror("Error", "Unsupported file format selected.")
+
+    def save_transformer_and_model(self):
+        if not self.model:
+            messagebox.showerror("Error", "Model has not been initialized. Please initialize the model first.")
+            return
+        if not self.tokenizer:
+            messagebox.showerror("Error", "Tokenizer has not been initialized. Please load a tokenizer first.")
+            return
+
+        transformer_data = {
+            "vocab_size": self.vocab_size.get(),
+            "embed_size": self.hidden_size.get(),
+            "hidden_size": self.hidden_size.get(),
+            "num_layers": self.num_layers.get(),
+            "architecture": self.architecture.get(),
+            "num_parameters": self.num_parameters.get(),
+            "layers": self.layers
+        }
+
+        directory = filedialog.askdirectory(title="Select Save Directory")
+        if directory:
+            # Save configuration
+            config_path = os.path.join(directory, "model_config.json")
+            with open(config_path, "w") as file:
+                json.dump(transformer_data, file, indent=4)
+
+            # Save weights
+            if self.architecture.get() == "Quaternion Transformer":
+                model_file_name = 'quaternion_transformer_model.pth'
+            elif self.architecture.get() == "Quaternion MatMul-Free LM":
+                model_file_name = 'quaternion_matmul_free_lm.pth'
+            else:
+                messagebox.showerror("Error", f"Unsupported architecture: {self.architecture.get()}")
+                return
+
+            model_path = os.path.join(directory, model_file_name)
+            torch.save(self.model.state_dict(), model_path)
+
+            # Save tokenizer
+            self.tokenizer.save_pretrained(directory)
+
+            messagebox.showinfo("Success", "Model, tokenizer, and configuration saved successfully!")
+            logging.info("Model, tokenizer, and configuration saved successfully.")
+
+    def select_dataset(self):
+        self.dataset_path = filedialog.askdirectory(title="Select Dataset Directory")
+        if self.dataset_path:
+            messagebox.showinfo("Success", f"Dataset directory selected: {self.dataset_path}")
+
+    def select_vocab(self):
+        self.vocab_path = filedialog.askopenfilename(
+            title="Select Vocabulary File",
+            filetypes=[("JSON files", "*.json"), ("Text files", "*.txt"), ("All files", "*.*")]
+        )
+        if self.vocab_path:
+            messagebox.showinfo("Success", f"Vocabulary file selected: {self.vocab_path}")
+
+    def select_tokenizer(self):
+        self.tokenizer_path = filedialog.askopenfilename(
+            title="Select Tokenizer File",
+            filetypes=[("JSON files", "*.json"), ("All files", "*.*")]
+        )
+        if self.tokenizer_path:
+            messagebox.showinfo("Success", f"Tokenizer file selected: {self.tokenizer_path}")
+
+    def test_tokenizer(self):
+        if not self.tokenizer:
+            messagebox.showerror("Error", "Tokenizer not loaded.")
+            return
+        sample_text = simpledialog.askstring("Test Tokenizer", "Enter a sample text to tokenize:")
+        if sample_text:
+            tokens = self.tokenizer.tokenize(sample_text)
+            token_ids = self.tokenizer.encode(sample_text)
+            logging.info(f"Sample Text: {sample_text}")
+            logging.info(f"Tokens: {tokens}")
+            logging.info(f"Token IDs: {token_ids}")
+            messagebox.showinfo("Tokenizer Test", f"Tokens: {tokens}\nToken IDs: {token_ids}")
+
+    def save_dataset_as_text(self):
+        if not hasattr(self, 'text_data') or not self.text_data:
+            messagebox.showerror("Error", "No dataset loaded or processed to save.")
+            return
+
+        save_path = filedialog.asksaveasfilename(
+            title="Save Dataset as Text File",
+            defaultextension=".txt",
+            filetypes=[("Text files", "*.txt"), ("All files", "*.*")]
+        )
+        if save_path:
+            try:
+                with open(save_path, 'w', encoding='utf-8') as f:
+                    for line in self.text_data:
+                        f.write(line + '\n')
+                messagebox.showinfo("Success", f"Dataset saved to {save_path}")
+                logging.info(f"Dataset saved to {save_path}")
+            except Exception as e:
+                logging.error(f"Failed to save dataset: {e}")
+                messagebox.showerror("Error", f"Failed to save dataset: {e}")
+
+
+
+    def create_tokenizer_from_vocab(self):
+        try:
+            # Ask the user to select the vocabulary file
+            vocab_path = filedialog.askopenfilename(
+                title="Select Vocabulary File",
+                filetypes=[("JSON files", "*.json"), ("All files", "*.*")]
+            )
+            if not vocab_path:
+                messagebox.showerror("Error", "No vocabulary file selected.")
+                return
+
+            with open(vocab_path, 'r', encoding='utf-8') as f:
+                vocab = json.load(f)
+
+            # Create a word-level tokenizer
+            tokenizer = Tokenizer(models.WordLevel(vocab=vocab, unk_token="<UNK>"))
+            tokenizer.pre_tokenizer = pre_tokenizers.Whitespace()
+
+            # Wrap with PreTrainedTokenizerFast
+            self.tokenizer = PreTrainedTokenizerFast(
+                tokenizer_object=tokenizer,
+                unk_token='<UNK>',
+                pad_token='<PAD>',
+                bos_token='<BOS>',
+                eos_token='<EOS>',
+                model_max_length=1024,
+            )
+
+            # Ensure special tokens are added
+            self.tokenizer.add_special_tokens({
+                'unk_token': '<UNK>',
+                'pad_token': '<PAD>',
+                'bos_token': '<BOS>',
+                'eos_token': '<EOS>'
+            })
+
+            # Save the tokenizer
+            save_directory = filedialog.askdirectory(title="Select Directory to Save Tokenizer")
+            if save_directory:
+                os.makedirs(save_directory, exist_ok=True)
+                self.tokenizer.save_pretrained(save_directory)
+                self.tokenizer_path = os.path.join(save_directory, 'tokenizer.json')
+                messagebox.showinfo("Success", f"Tokenizer saved to {self.tokenizer_path}")
+                logging.info(f"Tokenizer saved to {self.tokenizer_path}")
+            else:
+                messagebox.showerror("Error", "No save directory selected for tokenizer.")
+                return
+
+            # Test the tokenizer
+            test_text = "Hello World!\nThis is a test.\tLet's remove line breaks and tabs."
+            tokens = self.tokenizer.tokenize(test_text)
+            logging.info(f"Test tokenization of '{test_text}': {tokens}")
+
+            tokenizer_vocab = self.tokenizer.get_vocab()
+            sorted_vocab = dict(sorted(tokenizer_vocab.items(), key=lambda item: item[1]))
+            logging.info(f"Sorted Tokenizer Vocabulary: {sorted_vocab}")
+
+            logging.info("Tokenizer created and saved successfully")
+        except Exception as e:
+            logging.error(f"Failed to create tokenizer: {str(e)}")
+            messagebox.showerror("Error", f"Failed to create tokenizer: {str(e)}")
+            raise
+
+    def load_tokenizer(self):
+        try:
+            self.tokenizer_path = filedialog.askopenfilename(
+                title="Select Tokenizer File",
+                filetypes=[("JSON files", "*.json"), ("All files", "*.*")]
+            )
+            if not self.tokenizer_path or not os.path.exists(self.tokenizer_path):
+                raise FileNotFoundError("Tokenizer file not selected or does not exist.")
+
+            self.tokenizer = PreTrainedTokenizerFast(tokenizer_file=self.tokenizer_path)
+            logging.info(f"Tokenizer loaded from {self.tokenizer_path}")
+
+            # Load special tokens map
+            special_tokens_path = os.path.join(os.path.dirname(self.tokenizer_path), "special_tokens_map.json")
+            if os.path.exists(special_tokens_path):
+                with open(special_tokens_path, "r") as file:
+                    special_tokens = json.load(file)
+
+                for key, value in special_tokens.items():
+                    if isinstance(value, dict):
+                        special_tokens[key] = AddedToken(value["content"], lstrip=value.get("lstrip", False),
+                                                         rstrip=value.get("rstrip", False))
+                    elif not isinstance(value, (str, AddedToken)):
+                        raise ValueError(f"Invalid token format for key {key}: {value}")
+
+                self.tokenizer.add_special_tokens(special_tokens)
+                logging.info(f"Special tokens added: {special_tokens}")
+
+            # Load tokenizer configuration
+            tokenizer_config_path = os.path.join(os.path.dirname(self.tokenizer_path), "tokenizer_config.json")
+            if os.path.exists(tokenizer_config_path):
+                with open(tokenizer_config_path, "r") as file:
+                    tokenizer_config = json.load(file)
+                    self.tokenizer.init_kwargs.update(tokenizer_config)
+
+                    # Check and set model_max_length
+                    if "model_max_length" in tokenizer_config:
+                        self.tokenizer.model_max_length = tokenizer_config["model_max_length"]
+                    logging.info(f"Tokenizer configuration loaded: {tokenizer_config}")
+
+            # Explicitly set model_max_length if still unset or unreasonable
+            if not hasattr(self.tokenizer, "model_max_length") or self.tokenizer.model_max_length > 1024 * 1024:
+                self.tokenizer.model_max_length = 1024  # Default to 1024 for character-level tokens
+
+            # Check consistency
+            tokenizer_vocab_size = len(self.tokenizer)
+            logging.info(f"Loaded tokenizer vocabulary size: {tokenizer_vocab_size}")
+            self.vocab_size.set(tokenizer_vocab_size)
+
+            # Ensure special tokens are correctly set
+            if not self.tokenizer.pad_token:
+                self.tokenizer.pad_token = "<PAD>"
+                self.tokenizer.pad_token_id = self.tokenizer.convert_tokens_to_ids("<PAD>")
+                logging.warning("Pad token was not set. Defaulting to <PAD>.")
+            if not self.tokenizer.unk_token:
+                self.tokenizer.unk_token = "<UNK>"
+                self.tokenizer.unk_token_id = self.tokenizer.convert_tokens_to_ids("<UNK>")
+                logging.warning("UNK token was not set. Defaulting to <UNK>.")
+            if not self.tokenizer.bos_token:
+                self.tokenizer.bos_token = "<BOS>"
+                self.tokenizer.bos_token_id = self.tokenizer.convert_tokens_to_ids("<BOS>")
+                logging.warning("BOS token was not set. Defaulting to <BOS>.")
+            if not self.tokenizer.eos_token:
+                self.tokenizer.eos_token = "<EOS>"
+                self.tokenizer.eos_token_id = self.tokenizer.convert_tokens_to_ids("<EOS>")
+                logging.warning("EOS token was not set. Defaulting to <EOS>.")
+            print("Special tokens map:", self.tokenizer.special_tokens_map)
+            print("Pad token ID:", self.tokenizer.pad_token_id)
+            print("Model max length:", self.tokenizer.model_max_length)
+            
+
+        except Exception as e:
+            logging.error(f"Failed to load tokenizer: {str(e)}")
+            messagebox.showerror("Error", f"Failed to load tokenizer: {str(e)}")
+
+    def select_or_create_tokenized_data(self):
+        use_chunked = self.use_chunked_dataset.get()
+        answer = messagebox.askyesno("Select or Create Tokenized Data", "Do you want to use existing tokenized data?")
+        
+        if answer:
+            if use_chunked:
+                # User wants to use existing chunked tokenized data, select a directory
+                self.tokenized_data_path = filedialog.askdirectory(
+                    title="Select Tokenized Data Directory",
+                    mustexist=True
+                )
+                if self.tokenized_data_path:
+                    messagebox.showinfo("Success", f"Tokenized data directory selected: {self.tokenized_data_path}")
+            else:
+                # User wants to use existing single tokenized data file, select a file
+                self.tokenized_data_path = filedialog.askopenfilename(
+                    title="Select Tokenized Data File",
+                    filetypes=[("JSON Lines files", "*.jsonl"), ("All files", "*.*")]
+                )
+                if self.tokenized_data_path:
+                    # Attempt to load the file to validate its content
+                    try:
+                        with open(self.tokenized_data_path, 'r', encoding='utf-8') as f:
+                            self.input_ids, self.labels = [], []
+                            for line in f:
+                                record = json.loads(line)
+                                self.input_ids.append(record['input_ids'])
+                                self.labels.append(record['labels'])
+                        messagebox.showinfo("Success", f"Tokenized data file loaded: {self.tokenized_data_path}")
+                        logging.info(f"Tokenized data file loaded successfully with {len(self.input_ids)} entries.")
+                    except Exception as e:
+                        messagebox.showerror("Error", f"Failed to load tokenized data file: {str(e)}")
+        else:
+            if use_chunked:
+                # User wants to create new chunked tokenized data, select a directory to save
+                self.tokenized_data_path = filedialog.askdirectory(
+                    title="Select Directory to Save Tokenized Data"
+                )
+                if self.tokenized_data_path:
+                    os.makedirs(self.tokenized_data_path, exist_ok=True)  # Ensure directory is created
+                    messagebox.showinfo("Success", f"Tokenized data will be saved to directory: {self.tokenized_data_path}")
+            else:
+                # User wants to create new single tokenized data file, select a file path
+                self.tokenized_data_path = filedialog.asksaveasfilename(
+                    title="Save Tokenized Data As",
+                    defaultextension=".jsonl",
+                    filetypes=[("JSON Lines files", "*.jsonl"), ("All files", "*.*")]
+                )
+                if self.tokenized_data_path:
+                    messagebox.showinfo("Success", f"Tokenized data will be saved to file: {self.tokenized_data_path}")
+
+
+            
+    def tokenize_data(self):
+        if not self.tokenizer:
+            messagebox.showerror("Error", "Tokenizer not loaded.")
+            return
+        if not hasattr(self, 'query_target_pairs') or not self.query_target_pairs:
+            messagebox.showerror("Error", "No query-target pairs loaded. Please load the dataset first.")
+            return
+        if not self.tokenized_data_path:
+            messagebox.showerror("Error", "Tokenized data path not set. Please select or create tokenized data.")
+            return
+
+        # Select training mode
+        training_mode = self.training_mode.get()  # "imitation", "completion", "response"
+        self.input_ids = []  # Initialize for unchunked dataset
+        self.labels = []  # Initialize for unchunked dataset
+        
+        try:
+            use_chunked = self.use_chunked_dataset.get()
+            if use_chunked:
+                #create path if none
+                os.makedirs(self.tokenized_data_path, exist_ok=True)
+                chunk_size = 32
+                num_chunks = (len(self.query_target_pairs) + chunk_size - 1) // chunk_size
+
+                for chunk_idx in range(num_chunks):
+                    chunk_pairs = self.query_target_pairs[chunk_idx * chunk_size: (chunk_idx + 1) * chunk_size]
+                    chunk_file_path = os.path.join(self.tokenized_data_path, f'chunk_{chunk_idx}.jsonl')
+
+                    with open(chunk_file_path, 'w', encoding='utf-8') as f:
+                        for query, target in chunk_pairs:
+                            input_ids, labels = self._generate_training_pairs(query, target, training_mode)
+                            if input_ids and labels:
+                                record = {'input_ids': input_ids, 'labels': labels}
+                                f.write(json.dumps(record) + '\n')
+                logging.info(f"Chunk {chunk_idx} tokenized and saved to {chunk_file_path}")
+
+                messagebox.showinfo("Success", f"Data tokenized into {num_chunks} chunks and saved successfully to {self.tokenized_data_path}.")
+                logging.info(f"Data tokenized into {num_chunks} chunks and saved successfully to {self.tokenized_data_path}.")
+            else:
+                with open(self.tokenized_data_path, 'w', encoding='utf-8') as f:
+                    for query, target in self.query_target_pairs:
+                        input_ids, labels = self._generate_training_pairs(query, target, training_mode)
+
+                        if input_ids and labels:
+                            self.input_ids.append(input_ids)  # Store for training
+                            self.labels.append(labels)  # Store for training
+                            record = {'input_ids': input_ids, 'labels': labels}
+
+
+                            f.write(json.dumps(record) + '\n')
+                logging.info(f"Input IDs: {len(self.input_ids)} sequences loaded.")
+                logging.info(f"Labels: {len(self.labels)} sequences loaded.")
+                messagebox.showinfo("Success", f"Data tokenized and saved successfully to {self.tokenized_data_path}.")
+                logging.info(f"Data tokenized and saved successfully to {self.tokenized_data_path}.")
+        except Exception as e:
+            logging.error(f"Tokenization failed: {str(e)}")
+            messagebox.showerror("Error", f"Tokenization failed: {str(e)}")
+
+    def _generate_training_pairs(self, query, target, training_mode):
+        # Tokenize query and target
+        query_ids = self.tokenizer.encode(query, truncation=True, max_length=1024)
+        target_ids = self.tokenizer.encode(target, truncation=True, max_length=1024)
+        # Convert tokens to integers
+        query_ids = [int(token) for token in query_ids]
+        target_ids = [int(token) for token in target_ids]
+
+
+        if training_mode == "imitation":
+            input_ids = query_ids + [self.tokenizer.eos_token_id] 
+            labels = query_ids + [self.tokenizer.eos_token_id] 
+        elif training_mode == "completion":
+            partial_length = len(query_ids) // 2
+            partial_input = query_ids[:partial_length]
+            #completion = query_ids[partial_length:] + [self.tokenizer.eos_token_id]
+
+            input_ids = partial_input + [self.tokenizer.eos_token_id]
+            # For completion, we want labels to represent the entire query, not just completion
+            labels = query_ids + [self.tokenizer.eos_token_id]  
+        else:  # response
+            input_ids = query_ids + [self.tokenizer.eos_token_id]
+            labels = target_ids + [self.tokenizer.eos_token_id]
+
+        return input_ids, labels
+
+    def add_layer(self):
+        layer_type = simpledialog.askstring("Layer Type", "Enter layer type (e.g., attention, feed_forward)")
+        if layer_type:
+            layer_config = {
+                "type": layer_type,
+                "parameters": {}  # Placeholder for future parameter configuration
+            }
+            self.layers.append(layer_config)
+            messagebox.showinfo("Layer Added", f"Layer of type '{layer_type}' added.")
+
+    def save_transformer(self):
+        transformer_data = {
+            "num_parameters": self.num_parameters.get(),
+            "layers": self.layers
+        }
+
+        file_path = filedialog.asksaveasfilename(defaultextension=".json", filetypes=[("JSON files", "*.json")])
+        if file_path:
+            with open(file_path, "w") as file:
+                json.dump(transformer_data, file, indent=4)
+            messagebox.showinfo("Save", "Transformer saved successfully!")
+            logging.info(f"Number of layers in the model: {len(self.model.transformer_encoder.layers)}")
+
+    def load_transformer(self):
+        file_path = filedialog.askopenfilename(filetypes=[("JSON files", "*.json")])
+        if file_path:
+            with open(file_path, "r") as file:
+                transformer_data = json.load(file)
+            self.num_parameters.set(transformer_data["num_parameters"])
+            self.layers = transformer_data["layers"]
+            messagebox.showinfo("Success", "Transformer loaded successfully")
+
+    def load_model(self):
+        try:
+            if not self.tokenizer:
+                vocab_size = self.vocab_size.get()
+            else:
+                vocab_size = len(self.tokenizer)
+
+            # Log and validate vocab size
+            logging.info(f"Tokenizer vocabulary size: {vocab_size}")
+            self.vocab_size.set(vocab_size)
+
+            # Initialize the model based on architecture
+            if self.architecture.get() == "Quaternion Transformer":
+                self.model = QuaternionTransformer(
+                    vocab_size=vocab_size,
+                    embedding_dim=self.hidden_size.get(),
+                    hidden_dim=self.hidden_size.get(),
+                    num_layers=self.num_layers.get(),
+                    seq_length=1024
+                )
+            elif self.architecture.get() == "Quaternion MatMul-Free LM":
+                self.model = QuaternionTransformer(
+                    vocab_size=vocab_size,
+                    embedding_dim=self.hidden_size.get(),
+                    hidden_dim=self.hidden_size.get(),
+                    seq_length=1024
+                )
+            else:
+                messagebox.showerror("Error", f"Unsupported architecture: {self.architecture.get()}")
+                return
+
+            # Move the entire model to the selected device
+
+            self.model.to(self.device)
+            logging.info(f"Model moved to device: {self.device}")
+
+            # Load checkpoint if a model file is selected
+            if self.model_path and self.model_path.endswith('.pth'):
+                state_dict = torch.load(self.model_path, map_location=self.device)
+                self.model.load_state_dict(state_dict, strict=True)
+                logging.info("Model weights loaded and resized successfully.")
+
+            logging.info(f"Model initialized on device: {self.device}")
+            messagebox.showinfo("Success", "Model initialized successfully.")
+
+        except Exception as e:
+            logging.error(f"Failed to initialize model: {str(e)}")
+            messagebox.showerror("Error", f"Failed to initialize model: {str(e)}")
+
+
+    def calculate_learning_rate(self, total_params):
+        # Calculate learning rate based on total parameters using the derived formula
+        # LR = 17.38 * (Model Size)^-0.424
+        lr = 17.38 * (total_params ** -0.424)
+        return lr
+
+    def start_training(self):
+        # Start training in a separate thread to keep the GUI responsive
+        self.stop_training.clear()
+        training_thread = threading.Thread(target=self.training_loop)
+        training_thread.start()
+
+    def update_progress(self, progress_value):
+        self.progress_bar['value'] = progress_value
+
+    def update_status(self, message):
+        self.status_label.config(text=f"Status: {message}")
+
+    def save_checkpoint(self, model, optimizer, epoch, path):
+        if not isinstance(path, (str, os.PathLike)):
+            raise TypeError(f"Expected path to be str or os.PathLike, got {type(path).__name__}")
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        torch.save({
+            'epoch': epoch,
+            'model_state_dict': model.state_dict(),
+            'optimizer_state_dict': optimizer.state_dict(),
+        }, path)
+        
+
+
+    def validate_training_parameters(self):
+        # Validate batch size
+        try:
+            batch_size = int(self.batch_size.get())
+            if batch_size <= 0:
+                raise ValueError
+        except (TypeError, ValueError):
+            logging.error(f"Invalid batch size: {self.batch_size.get()}")
+            messagebox.showerror("Error", "Batch size must be a positive integer.")
+            return False
+
+        # Validate epochs
+        try:
+            epochs = int(self.epochs.get())
+            if epochs <= 0:
+                raise ValueError
+        except (TypeError, ValueError):
+            logging.error(f"Invalid epochs value: {self.epochs.get()}")
+            messagebox.showerror("Error", "Epochs must be a positive integer.")
+            return False
+
+        if not self.tokenized_data_path or not os.path.exists(self.tokenized_data_path):
+            logging.error("Tokenized data path is invalid or does not exist.")
+            messagebox.showerror("Error", "Tokenized data is not selected or does not exist.")
+            return False
+
+        if not hasattr(self.tokenizer, 'pad_token_id') or self.tokenizer.pad_token_id is None:
+            logging.error("Tokenizer pad_token_id is not set.")
+            messagebox.showerror("Error", "Tokenizer is missing pad_token_id.")
+            return False
+
+        return True
+
+    def training_test(self):
+        
+        if self.test_bool.get()==True:
+
+            # Initialize and test
+            self.model.to(self.device)
+        else:
+            pass
+        try:
+            if self.use_chunked_dataset.get():
+                    # Initialize the ChunkedDataset
+                    dataset = ChunkedDataset(
+                        tokenized_data_path=self.tokenized_data_path,
+                        tokenizer=self.tokenizer,
+                        max_length=1024
+                    )
+                    dataloader = DataLoader(
+                        dataset,
+                        batch_size=self.batch_size.get(),
+                        shuffle=True,
+                        num_workers=0,
+                        pin_memory=False,
+                        collate_fn=collate_fn
+                    )
+            else:
+                max_length = 1024
+                # Convert lists of token IDs to tensors
+                input_ids, seq_lengths = zip(*[
+                    (
+                        torch.tensor(tokens + [self.tokenizer.pad_token_id] * (max_length - len(tokens)), dtype=torch.int64, device=self.device)[:max_length],
+                        min(len(tokens), max_length)
+                    )
+                    for tokens in self.input_ids
+                ])
+                logging.info("input ids torched to tensor")
+                labels = [
+                    torch.tensor(tokens + [self.tokenizer.pad_token_id] * (max_length - len(tokens)), dtype=torch.int64, device=self.device)[:max_length]
+                    for tokens in self.labels
+                ]
+                logging.info("labels torched to tensor")
+
+
+                input_ids = torch.stack(input_ids)
+                logging.info("input ids stacked by torch")
+
+                labels = torch.stack(labels)
+
+
+                seq_lengths = torch.tensor(seq_lengths, dtype=torch.long, device=self.device)
+                logging.info("datas stacked and seq lengths torched")
+                # Perform assertions to validate tensors
+                assert isinstance(input_ids, torch.Tensor), "input_ids should be a tensor"
+                assert isinstance(labels, torch.Tensor), "labels should be a tensor"
+                assert input_ids.dtype == torch.long, "input_ids should be of type torch.long"
+                assert labels.dtype == torch.long, "labels should be of type torch.long"
+                assert input_ids.size(1) == max_length, "input_ids should be padded to max_length"
+                assert labels.size(1) == max_length, "labels should be padded to max_length"
+                dataset = torch.utils.data.TensorDataset(input_ids, labels, seq_lengths)
+                logging.info("dataset torched")
+                dataloader = DataLoader(
+                    dataset,
+                    batch_size=int(self.batch_size.get()),
+                    shuffle=True,
+                    num_workers=0,  # Set to 0 to prevent multiple workers from loading chunks simultaneously
+                    pin_memory=False,
+                )
+                logging.info("dataloader defined")
+            try:
+                    self.model.to(self.device)
+                    self.model.train()
+                    sample_input, sample_attention_mask, sample_labels, sample_seq_length = next(iter(dataloader))
+                    logging.info("sample data set for test training")
+
+                    sample_input = sample_input.to(self.device)
+                    logging.info("sample inputs sent to device")
+
+                    sample_labels = sample_labels.to(self.device)
+                    logging.info("sample labels sent to device")
+
+                    sample_seq_length = sample_seq_length.to(self.device)
+                    logging.info("sample seq length sent to device")
+
+                    logging.debug(f"Shape of batch_input_ids before generate_square_subsequent_mask: {sample_input.shape}")
+                    seq_lengths = sample_seq_length.to(self.device)
+                    logging.debug("Batch moved to device")
+                    # Prepare input and target sequences
+                    batch_target_ids = sample_labels
+                    logging.info("sample labels set to target ids")
+
+                    batch_input_ids = sample_input
+                    logging.info("sample inputs set to batch input ids")
+
+                    # Move batches and targets to the correct device
+                    batch_input_ids = batch_input_ids.to(self.device, dtype=torch.long)
+                    logging.info("sample input set to long")
+
+
+                    # Ensure input and target tensors are aligned for batch size
+                    if batch_input_ids.size(1) != batch_target_ids.size(1):
+                        raise ValueError("Input and target sequence lengths are mismatched.")
+                    # Generate src_mask                    
+                    logging.debug(f"Shape of batch_input_ids before generate_square_subsequent_mask: {batch_input_ids.shape}")
+                    src_mask = generate_square_subsequent_mask(batch_input_ids.size(1)).to(self.device)
+
+                    # Log the shapes before combining
+                    logging.debug(f"Shape of src_mask: {src_mask.shape}")
+                    # Expand src_mask to match batch size and number of heads 
+                    src_mask = src_mask.unsqueeze(0).expand(batch_input_ids.size(0), -1, -1) 
+                    logging.debug(f"Shape of src_mask after expansion: {src_mask.shape}")
+                    # Combine masks without slicing (corrected)
+
+                    batch_size, seq_len = batch_input_ids.size()
+                    # Assuming batch_input_ids and pad_token_id are defined.
+                    combined_mask = create_combined_mask(batch_input_ids, self.tokenizer.pad_token_id)
+
+                    # Log the shape of the combined mask
+                    logging.debug(f"Shape of combined_mask: {combined_mask.shape}")
+                    logging.debug(f"Shape of batch_input_ids being passed to model: {batch_input_ids.shape}")
+
+                    # Forward pass
+    
+                    outputs, _ = self.model(batch_input_ids, mask=combined_mask)
+                    logging.debug(f"Shape of outputs after forward pass: {outputs.shape}")
+
+                    if torch.isnan(outputs).any() or torch.isinf(outputs).any():
+                                logging.error("Model outputs contain NaN or Inf values.")
+                                raise ValueError("Model outputs contain NaN or Inf values.")
+
+            except Exception as e:
+                        raise ValueError(f"forward pass failed for {str(e)}")
+
+            logging.debug(f"Shape of outputs: {outputs.shape}")
+
+            logits_reshaped = outputs[:, :batch_target_ids.size(1), :].reshape(-1, outputs.size(-1))
+            targets_reshaped = batch_target_ids.reshape(-1)
+
+            loss = F.cross_entropy(
+                        logits_reshaped,
+                        targets_reshaped,
+                        ignore_index=self.tokenizer.pad_token_id
+            )
+            loss.backward()
+            print("Forward and backward pass successful. Loss:", loss.item())
+        except Exception as e:
+            print("Error during forward/backward pass:", e)
+
+    def training_loop(self):
+        if not self.validate_training_parameters():
+            return
+
+        logging.info("All training parameters and data are properly initialized.")
+        if not self.model:
+            logging.error("Model not initialized before training")
+            return
+
+        try:
+            if self.use_chunked_dataset.get():
+                # Initialize the ChunkedDataset
+                dataset = ChunkedDataset(
+                    tokenized_data_path=self.tokenized_data_path,
+                    tokenizer=self.tokenizer,
+                    max_length=1024
+                )
+                dataloader = DataLoader(
+                    dataset,
+                    batch_size=self.batch_size.get(),
+                    shuffle=True,
+                    num_workers=0,
+                    pin_memory=False,
+                    collate_fn=collate_fn
+                )
+            else:
+                # Initialize the standard dataset and dataloader
+
+                # Ensure the tokenizer is loaded and has a valid pad_token_id
+                pad_token_id = tokenizer.pad_token_id if tokenizer else 0  # Default to 1 if tokenizer isn't set      
+                max_length = 1024  # Adjust as needed
+                logging.info("max_length set")
+                # Convert lists of token IDs to tensors and calculate original sequence lengths
+                input_ids, seq_lengths = zip(*[
+                    (
+                        torch.tensor(tokens + [pad_token_id] * (max_length - len(tokens)), dtype=torch.int64, device=self.device)[:max_length],
+                        min(len(tokens), max_length)
+                    )
+                    for tokens in self.input_ids
+                ])
+                logging.info("input ids torched to tensor")
+
+                labels = [
+                    torch.tensor(tokens + [pad_token_id] * (max_length - len(tokens)), dtype=torch.int64, device=self.device)[:max_length]
+                    for tokens in self.labels
+                ]
+                logging.info("labels torched to tensor")
+
+
+                # Stack tensors
+                input_ids = torch.stack(input_ids)
+                labels = torch.stack(labels)
+
+                seq_lengths = torch.tensor(seq_lengths, dtype=torch.long)
+                logging.info("datas stacked and seq lengths torched")
+
+                # Perform assertions to validate tensors
+                assert isinstance(input_ids, torch.Tensor), "input_ids should be a tensor"
+                assert isinstance(labels, torch.Tensor), "labels should be a tensor"
+                assert input_ids.dtype == torch.long, "input_ids should be of type torch.long"
+                assert labels.dtype == torch.long, "labels should be of type torch.long"
+                assert input_ids.size(1) == max_length, "input_ids should be padded to max_length"
+                assert labels.size(1) == max_length, "labels should be padded to max_length"
+
+                dataset = torch.utils.data.TensorDataset(input_ids, labels, seq_lengths)
+                logging.info("dataset torched")
+                dataloader = DataLoader(
+                    dataset,
+                    batch_size=int(self.batch_size.get()),
+                    shuffle=True,
+                    num_workers=0,  # Set to 0 to prevent multiple workers from loading chunks simultaneously
+                    pin_memory=False,
+                    collate_fn=collate_fn
+                )
+                logging.info("dataloader defined")
+            ##chunked vs. standard else complete
+            # Log dataset samples
+
+
+            # Adjust learning rate based on architecture
+            total_params = self.num_parameters.get()
+            lr = self.learning_rate.get()
+            logging.info(f"Learning Rate: {lr} for total parameters: {total_params}")
+
+            # Learning rate scheduler
+            total_steps = self.epochs.get() * len(dataloader)
+            logging.info(f"Total training steps: {total_steps}")
+            #num_warmup_steps = total_steps // 10  # Warmup for 10% of training
+            optimizer = torch.optim.AdamW(self.model.parameters(), lr=lr, weight_decay=1e-5)
+            #scheduler = self.get_cosine_schedule_with_warmup(optimizer, num_warmup_steps, total_steps)
+
+
+            scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=total_steps, eta_min=lr * 0.1)
+            logging.info("Scheduler defined")
+
+            self.model.train()
+            logging.info("Model set to training mode")
+            progress_step = 0
+            n = 0
+            
+            for epoch in range(self.epochs.get()):
+                if self.stop_training.is_set():
+                    logging.info("Training stopped by user.")
+                    messagebox.showinfo("Info", "Training stopped by user.")
+                    break
+
+                epoch_loss = 0
+                logging.info(f"Epoch {epoch+1} started")
+                
+          
+                # Training loop
+                for batch_idx, (batch_input_ids, batch_labels, seq_lengths) in enumerate(dataloader):
+                    if self.stop_training.is_set():
+                        logging.info("Training stopped by user.")
+                        messagebox.showinfo("Info", "Training stopped by user.")
+                        return
+                    
+                    optimizer.zero_grad()
+                    logging.debug("Optimizer gradients zeroed")
+
+                    # Move batches and targets to the correct device 
+                    batch_input_ids = batch_input_ids.to(self.device)
+                    batch_labels = batch_labels.to(self.device)
+                    seq_lengths = seq_lengths.to(self.device)
+                    logging.debug("Batch moved to device")
+
+                    # Logging epoch and batch info
+                    logging.debug(f'Epoch: {epoch + 1}, Batch: {batch_idx + 1}')
+                    logging.debug(f'Batch input_ids shape: {batch_input_ids.shape}')  # (batch_size, 1024)
+                    logging.debug(f'Using device: {self.device}')
+
+                    logging.debug(f"Shape of batch_input_ids before generate_square_subsequent_mask: {batch_input_ids.shape}")
+
+                    # Log the shapes before combining
+                    # Expand src_mask to match batch size and number of heads 
+
+                    # Combine masks without slicing (corrected)
+                    batch_size, seq_len = batch_input_ids.size()
+                    # Assuming batch_input_ids and pad_token_id are defined.
+                    combined_mask = create_combined_mask(batch_input_ids, self.tokenizer.pad_token_id)
+
+                    # Log the shape of the combined mask
+                    logging.debug(f"Shape of combined_mask: {combined_mask.shape}")
+                    logging.debug(f"Shape of batch_input_ids being passed to model: {batch_input_ids.shape}")
+
+                    # Forward pass
+                    try:
+
+                        outputs, _ = self.model(batch_input_ids, mask=combined_mask)
+                        if torch.isnan(outputs).any() or torch.isinf(outputs).any():
+                                logging.error("Model outputs contain NaN or Inf values.")
+                                raise ValueError("Model outputs contain NaN or Inf values.")
+
+                    except Exception as e:
+                        raise ValueError(f"forward pass failed for {str(e)}")
+
+
+                    logits = outputs.view(-1, outputs.size(-1))
+                    # Debug log to check the shape of logits
+                    logging.debug(f"Shape of logits: {logits.shape}")
+                    #Prepare targets
+                    targets = batch_labels.view(-1)
+                    # Ensure targets are in the correct type
+                    if targets.dtype != torch.long:
+                        targets = targets.long()
+
+                    # Compute loss
+                    loss = F.cross_entropy(logits, targets, ignore_index=self.pad_token_id)
+
+                    logging.info(f"Loss computed: {loss.item()}")
+
+
+                    # Backward pass and optimization
+                    scaler.scale(loss).backward()
+                    logging.info("Loss backward computed")
+
+                    for param_group in optimizer.param_groups:
+                        logging.debug(f"Learning rate: {param_group['lr']}")
+
+                    # Check for NaN or Inf in gradients
+                    for name, param in self.model.named_parameters():
+                        if param.grad is not None:
+                            if torch.isnan(param.grad).any() or torch.isinf(param.grad).any():
+                                logging.error(f"Gradient for {name} contains NaN or Inf.")
+                                continue
+                            
+                    for name, param in self.model.named_parameters():
+                        if param.grad is not None:
+                            logging.debug(f"Gradient for {name}: mean={param.grad.mean().item():.4f}, max={param.grad.max().item():.4f}, min={param.grad.min().item():.4f}")
+                        else:
+                            logging.debug(f"Gradient for {name} is None")
+
+                    # Gradient clipping
+                    scaler.unscale_(optimizer)
+
+                    total_norm = 0.0
+                    for p in self.model.parameters():
+                        if p.grad is not None:
+                            total_norm += p.grad.data.norm(2).item() ** 2
+                    total_norm = total_norm ** 0.5
+                    logging.info(f"Gradient norm: {total_norm}")
+
+                    #torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=5.0)
+                    
+                    total_norm = 0.0
+                    for p in self.model.parameters():
+                        if p.grad is not None:
+                            total_norm += p.grad.data.norm(2).item() ** 2
+                    total_norm = total_norm ** 0.5
+                    logging.info(f"Gradient norm after clipping: {total_norm}")
+
+                    # Log gradients for debugging
+                    for name, param in self.model.named_parameters():
+                        if param.grad is not None:
+                            logging.debug(f"Gradients for {name}: {param.grad}")
+                        else:
+                            logging.warning(f"No gradients found for {name}.")
+                            
+                    optimizer.step()
+
+                    n+=1
+                    print(f"Iteration {n}, Loss: {loss.item()}, LR: {optimizer.param_groups[0]['lr']}")
+                    logging.info("Gradient clipping applied")
+                    
+
+                                            
+                    # Before optimizer step
+                    for name, param in self.model.named_parameters():
+                        if param.requires_grad:
+                            logging.debug(f"Before step - {name}: mean={param.data.mean().item():.4f}, std={param.data.std().item():.4f}")
+
+                    scaler.step(optimizer)
+                    
+
+                    # After optimizer step
+                    for name, param in self.model.named_parameters():
+                        if param.requires_grad:
+                            logging.debug(f"After step - {name}: mean={param.data.mean().item():.4f}, std={param.data.std().item():.4f}")
+
+                    scaler.update()
+
+                    logging.info("Optimizer step and scaler update completed")
+
+                    scheduler.step()
+                    logging.debug("Scheduler step completed")
+
+                    epoch_loss += loss.item()
+                    progress_step += 1
+                    progress_value = (progress_step / total_steps) * 100
+                    self.root.after(0, self.update_progress, progress_value)
+
+                    # Save checkpoint at specified intervals
+                    save_interval = 25  # Save every 25%
+                    progress_percentage = (batch_idx + 1) / len(dataloader) * 100
+                    if abs(progress_percentage % save_interval) < 1e-6:  # Avoid floating-point issues
+                        checkpoint_path = f"checkpoints/epoch_{epoch}_batch_{batch_idx}.pth"
+                        self.save_checkpoint(self.model, optimizer, epoch, checkpoint_path)
+                        logging.info(f"Checkpoint saved at epoch {epoch}, batch {batch_idx}, progress: {progress_percentage:.2f}%")
+
+
+
+                # Log epoch loss
+                average_epoch_loss = epoch_loss / len(dataloader)
+                self.loss_history.append(average_epoch_loss)
+                logging.info(f"Epoch {epoch + 1}/{self.epochs.get()} completed with average loss: {average_epoch_loss}")
+                self.root.after(0, self.update_status, f"Epoch {epoch + 1}/{self.epochs.get()} completed. Current LR = {scheduler.get_last_lr()}")
+
+        except Exception as e:
+            logging.error(f"An error occurred during training: {str(e)}")
+            messagebox.showerror("Error", f"An error occurred during training: {str(e)}")
+
+    def improved_collate_fn(self, batch):
+        input_ids, attention_masks, labels, seq_lengths = zip(*batch)
+        
+        # Convert sequences to tensors if they aren't already
+        input_ids = [x if isinstance(x, torch.Tensor) else torch.tensor(x) for x in input_ids]
+        attention_masks = [x if isinstance(x, torch.Tensor) else torch.tensor(x) for x in attention_masks]
+        labels = [x if isinstance(x, torch.Tensor) else torch.tensor(x) for x in labels]
+        
+        # Find max length in batch
+        max_len = 1024
+        
+        # Pad sequences using torch operations
+        def pad_sequence(sequences, max_len, pad_value):
+            return torch.stack([
+                torch.cat([
+                    seq,
+                    torch.full((max_len - len(seq),), pad_value, dtype=seq.dtype, device=seq.device)
+                ]) if len(seq) < max_len else seq[:max_len]
+                for seq in sequences
+            ])
+        
+        # Pad all sequences
+        padded_input_ids = pad_sequence(input_ids, max_len, self.tokenizer.pad_token_id)
+        padded_attention_masks = pad_sequence(attention_masks, max_len, 0)
+        padded_labels = pad_sequence(labels, max_len, self.tokenizer.pad_token_id)
+        
+        # Convert sequence lengths to tensor
+        seq_lengths = torch.tensor(seq_lengths, dtype=torch.long)
+        
+        return padded_input_ids, padded_attention_masks, padded_labels, seq_lengths
+
+    def get_cosine_schedule_with_warmup(self, optimizer, num_warmup_steps, num_training_steps):
+        def lr_lambda(current_step):
+            if current_step < num_warmup_steps:
+                return float(current_step) / float(max(1, num_warmup_steps))
+            progress = float(current_step - num_warmup_steps) / float(max(1, num_training_steps - num_warmup_steps))
+            return max(0.0, 0.5 * (1.0 + math.cos(math.pi * progress)))
+            
+        return torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
+
+    def save_model(self):
+        if not self.model:
+            messagebox.showerror("Error", "Model has not been initialized. Cannot save.")
+            logging.error("Attempted to save model but model was not initialized.")
+            return
+        if not self.tokenizer:
+            messagebox.showerror("Error", "Tokenizer has not been initialized. Cannot save.")
+            logging.error("Attempted to save model but tokenizer was not initialized.")
+            return
+
+        save_directory = filedialog.askdirectory(title="Select Save Directory")
+        if save_directory:
+            config = {
+            "vocab_size": self.vocab_size.get(),
+            "embed_size": self.hidden_size.get(),
+            "hidden_size": self.hidden_size.get(),
+            "num_layers": self.num_layers.get(),
+            "architecture": self.architecture.get(),
+            "num_parameters": self.num_parameters.get(),
+            "layers": self.layers
+        }
+            config_path = os.path.join(save_directory, 'model_config.json')
+            with open(config_path, 'w') as f:
+                json.dump(config, f)
+
+            # Ensure embeddings match tokenizer
+            tokenizer_vocab_size = len(self.tokenizer)
+
+            # Save the model state dictionary
+            if self.architecture.get() == "Quaternion Transformer":
+                model_file_name = 'quaternion_transformer_model.pth'
+            elif self.architecture.get() == "Quaternion MatMul-Free LM":
+                model_file_name = 'quaternion_matmul_free_lm.pth'
+            else:
+                messagebox.showerror("Error", f"Unsupported architecture: {self.architecture.get()}")
+                return
+
+            model_path = os.path.join(save_directory, model_file_name)
+            torch.save(self.model.state_dict(), model_path)
+
+            # Save the tokenizer
+            self.tokenizer.save_pretrained(save_directory)
+
+            messagebox.showinfo("Success", "Model, tokenizer, and config saved successfully.")
+            logging.info("Model, tokenizer, and config saved successfully.")
+
+    def stop_training_command(self):
+        self.stop_training.set()
+        messagebox.showinfo("Stop Training", "Training stopped.")
+        logging.info("Training stopped by user.")
+
+    def expand_transformer(self):
+        # Placeholder method; not used in current implementation
+        pass
+
+    
+    def load_dataset(self):
+        if self.use_chunked_dataset.get():
+            # Load data from chunked files
+            self.tokenized_data_path = filedialog.askdirectory(
+                title="Select Tokenized Data Directory"
+            )
+            if not self.tokenized_data_path:
+                messagebox.showerror("Error", "No tokenized data directory selected.")
+                return
+
+            # Check if directory contains chunked data files
+            chunk_files = [f for f in os.listdir(self.tokenized_data_path) if f.startswith('chunk_') and f.endswith('.jsonl')]
+            if not chunk_files:
+                messagebox.showerror("Error", "No chunked data files found in the selected directory.")
+                return
+
+            self.chunked_files = [os.path.join(self.tokenized_data_path, f) for f in chunk_files]
+            messagebox.showinfo("Success", f"Loaded chunked dataset with {len(self.chunked_files)} files.")
+            logging.info(f"Loaded chunked dataset with {len(self.chunked_files)} files.")
+        else:
+            # Load standard dataset
+            if not self.dataset_path:
+                messagebox.showerror("Error", "No dataset directory selected.")
+                return
+
+            dataset_files = os.listdir(self.dataset_path)
+            self.query_target_pairs = []
+
+            for file in dataset_files:
+                file_path = os.path.join(self.dataset_path, file)
+                if file.endswith('.json') or file.endswith('.jsonl'):
+                    try:
+                        with open(file_path, 'r', encoding='utf-8') as f:
+                            if file.endswith('.jsonl'):
+                                for line in f:
+                                    conversation = json.loads(line.strip())
+                                    self.query_target_pairs.extend(self.extract_query_target_pairs([conversation]))
+
+                                # After loading query_target_pairs
+                                for i in range(min(5, len(self.query_target_pairs))):
+                                    query, target = self.query_target_pairs[i]
+
+
+                            else:
+                                data = json.load(f)
+                                self.query_target_pairs.extend(self.extract_query_target_pairs(data)) 
+                                # After loading query_target_pairs
+                                for i in range(min(5, len(self.query_target_pairs))):
+                                    query, target = self.query_target_pairs[i]
+                               
+                    except Exception as e:
+                        messagebox.showerror("Error", f"Failed to read JSON file '{file}': {str(e)}")
+                else:
+                    messagebox.showwarning("Warning", f"Unsupported file format: '{file}'")
+
+            if not self.query_target_pairs:
+                messagebox.showerror("Error", "No valid query/target pairs found in the dataset.")
+                return
+
+            # Store text data for saving as a text file
+            self.text_data = []
+            for query, target in self.query_target_pairs:
+                self.text_data.append(f"User: {query}\nAssistant: {target}")
+
+            messagebox.showinfo("Success", f"Loaded dataset with {len(self.query_target_pairs)} query/target pairs.")
+            logging.info(f"Loaded dataset with {len(self.query_target_pairs)} query/target pairs.")
+
+    def extract_query_target_pairs(self, data):
+        query_target_pairs = []
+        for conversation in data:
+            messages = conversation.get("messages", [])
+            for i in range(len(messages) - 1):
+                if messages[i]["role"] == "user" and messages[i + 1]["role"] == "assistant":
+                    query = messages[i]["content"].replace('\n', ' ').strip()
+                    target = messages[i + 1]["content"].replace('\n', ' ').strip()
+                    query_target_pairs.append((query, target))
+        return query_target_pairs
+
+
+
+# Main application entry point
+if __name__ == "__main__":
+    root = tk.Tk()
+    app = QuaternionTransformerGUI(root)
+    root.mainloop()
