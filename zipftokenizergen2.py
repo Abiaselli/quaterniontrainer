@@ -37,7 +37,7 @@ class BPEZipfTokenizer:
         sorted_words = [word for word, _ in self.word_frequencies.most_common(self.vocab_size - 4)]
         
         # Add special tokens
-        special_tokens = ["<PAD>", "<UNK>", "<SOS>", "<EOS>"]
+        special_tokens = ["<PAD>", "<UNK>", "<BOS>", "<EOS>"]
         self.vocab = {word: idx for idx, word in enumerate(special_tokens + sorted_words)}
         self.reverse_vocab = {idx: word for word, idx in self.vocab.items()}
     
