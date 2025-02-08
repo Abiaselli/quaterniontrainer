@@ -18,3 +18,5 @@ Also included is a folder with the latest version of my test model. It is set to
 If you use the test model, a batch size of 8 will take up about 8-9 GB on GPU (including the model.) It has reached a general loss of 4-6 with any input after about 3 epochs with a range of data, but requires multipe epochs to align with a dataset I believe. I plan to try out a larger model at some point, or potentially increase to octonions or something similar.
 
 Thanks, I hope you like it and am here to answer any questions!
+
+Special thanks to ChatGPT 4o for having an unlimited context length, a huge base of general knowledge, and being encouraging while always having a positive attitude. It is an excellent personal tutor, and a perfect extension of the Socratic method allowing any person to do things beyond their ordinary capability and knowledge. A warning though, if you use ChatGPT for tensor math you will still have to learn it and how Torch works and understand the math you are using to be able to align the dimensions yourself as AI has big problems doing this, and it will be impossible to debug issues or improve your work if you don't know what you are doing.
