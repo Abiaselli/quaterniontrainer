@@ -72,7 +72,7 @@ class BPEZipfTokenizer:
 # Example Usage
 if __name__ == "__main__":
     tokenizer = BPEZipfTokenizer()
-    json_files = [r"C:\Users\abias\.cursor-tutor\vccdoe\0000waveperceptron\dataset\smoltalk0.json", r"C:\Users\abias\.cursor-tutor\vccdoe\0000waveperceptron\dataset\smoltalk1.json", r"C:\Users\abias\.cursor-tutor\vccdoe\0000waveperceptron\dataset\smoltalk2.json", r"C:\Users\abias\.cursor-tutor\vccdoe\0000waveperceptron\dataset\smoltalk3.json"]
+    json_files = [r"INSERT DATASET PATH HERE", r"INSERT ADDITIONAL DATASETS SEPARATED BY COMMAS, BEGINNING WITH r TO ALLOW FOR PATH"]
     tokenizer.process_corpus(json_files)
     
     # Save tokenizer for future use
