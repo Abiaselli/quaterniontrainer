@@ -597,7 +597,7 @@ def generate_text_gui(model, tokenizer, input_text, max_length=max_length, tempe
             if next_token == tokenizer.eos_token_id:
                 break
 
-            if len(generated_tokens) == 512:
+            if len(generated_tokens) == 50:
                 break
         
 
