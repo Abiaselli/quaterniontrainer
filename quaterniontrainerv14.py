@@ -1888,16 +1888,16 @@ class QuaternionTransformerGUI:
                     optimizer_std.step()
 
                     #Remove optimizer steps and gradient to enable this for Quaternion Genetic Algo
-                    #qga = QuaternionGeneticAlgorithm(model)
-                    #model = qga.evolve(loss, dataloader)
+                    #qga = QuaternionGeneticAlgorithm(self.model)
+                    #self.model = qga.evolve(F.cross_entropy, dataloader)
 
                     #Remove optimizer steps and gradient code enable this for Quaternion NeuroEvolution of Augmenting Topologies (NEAT)
-                    #neat = QuaternionNEAT(model)
-                    #model = neat.evolve(loss, dataloader)
+                    #neat = QuaternionNEAT(self.model)
+                    #self.model = neat.evolve(F.cross_entropy, dataloader)
                     
                     #Remove optimizer steps and gradient lines to enable this for Quaternion Firefly Algo
-                    #firefly_optimizer = QuaternionFireflyOptimizer(model)
-                    #model = firefly_optimizer.optimize(loss, dataloader)
+                    #firefly_optimizer = QuaternionFireflyOptimizer(self.model)
+                    #self.model = firefly_optimizer.optimize(F.cross_entropy, dataloader)
 
                     n+=1
                     #edit this if optimizers are modified
