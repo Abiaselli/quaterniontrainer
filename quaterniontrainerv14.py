@@ -675,7 +675,8 @@ class QuaternionGeneticAlgorithm:
         for model in self.population:
             for param in model.parameters():
                 param.data += torch.randn_like(param) * self.mutation_rate  # Apply mutation
-
+        return self.select_best(loss_fn, data_loader)
+    
 class QuaternionFireflyOptimizer:
     def __init__(self, model, num_fireflies=5, alpha=0.1, beta=0.5):
         self.population = [copy.deepcopy(model) for _ in range(num_fireflies)]
