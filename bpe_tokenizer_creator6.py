@@ -9,7 +9,7 @@ from tokenizers.decoders import ByteLevel as ByteLevelDecoder
 from tokenizers.trainers import BpeTrainer
 
 # Parameters
-input_files = glob.glob(r"C:\Users\abias\OpenThoughts-114k\data\*.json")  # Adjust file path pattern
+input_files = glob.glob(r"file path\*.json")  # Adjust file path pattern
 max_vocab_size = 10000  # Adjust as needed
 prioritize_alphabet = False  # Set to True if you want a-z at the start
 
