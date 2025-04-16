@@ -1094,7 +1094,7 @@ class QuaternionTransformer(nn.Module):
             generated.append(next_token)
 
             # Optional early stop
-            if next_token == self.tokenizer_wrapper.eos_token_id:
+            if next_token == self.tokenizer_wrapper.eos_token
                 break
 
         if return_text:
